@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -22,13 +23,18 @@ var replOwner = strings.NewReplacer("'", "''", "\n", " ")
 
 func main() {
 	flagConnect := flag.String("connect", os.Getenv("BRUNO_ID"), "database to connect to")
+	flagJSON := flag.String("json", "", "json file to read/write from")
 	flag.Parse()
 
-	db, err := sql.Open("goracle", *flagConnect)
-	if err != nil {
-		log.Fatal(errors.Wrap(err, *flagConnect))
+	var db *sql.DB
+	if *flagConnect != "" || *flagJSON == "" {
+		var err error
+		db, err = sql.Open("goracle", *flagConnect)
+		if err != nil {
+			log.Fatal(errors.Wrap(err, *flagConnect))
+		}
+		defer db.Close()
 	}
-	defer db.Close()
 	var buf bytes.Buffer
 
 	var ownerW string
@@ -47,7 +53,7 @@ func main() {
 		ownerW = buf.String()
 	}
 
-	if err := Main(os.Stdout, db, ownerW); err != nil {
+	if err := Main(os.Stdout, db, *flagJSON, ownerW); err != nil {
 		log.Fatalf("%+v", err)
 	}
 }
@@ -58,24 +64,55 @@ var replDot = strings.NewReplacer(".", Dot, "$", "_")
 
 func name(s ...string) string { return replDot.Replace(strings.Join(s, Dot)) }
 
-func Main(w io.Writer, db *sql.DB, ownerW string) error {
-	var grp errgroup.Group
+func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
 	var constraints map[string][]Constraint
-	grp.Go(func() error {
-		var err error
-		constraints, err = readConstraints(db, ownerW)
-		return err
-	})
-
 	var tables []Table
-	grp.Go(func() error {
-		var err error
-		tables, err = readTables(db, ownerW)
-		return err
-	})
+	if db != nil {
+		var grp errgroup.Group
+		grp.Go(func() error {
+			var err error
+			constraints, err = readConstraints(db, ownerW)
+			return err
+		})
 
-	if err := grp.Wait(); err != nil {
-		return err
+		grp.Go(func() error {
+			var err error
+			tables, err = readTables(db, ownerW)
+			return err
+		})
+		if err := grp.Wait(); err != nil {
+			return err
+		}
+		if jsonFile != "" {
+			fh, err := os.Create(jsonFile)
+			if err != nil {
+				return err
+			}
+			defer fh.Close()
+			enc := json.NewEncoder(fh)
+			if err := enc.Encode(constraints); err != nil {
+				return err
+			}
+			if err := enc.Encode(tables); err != nil {
+				return err
+			}
+			if err := fh.Close(); err != nil {
+				return err
+			}
+		}
+	} else {
+		fh, err := os.Open(jsonFile)
+		if err != nil {
+			return err
+		}
+		defer fh.Close()
+		dec := json.NewDecoder(fh)
+		if err := dec.Decode(&constraints); err != nil {
+			return err
+		}
+		if err := dec.Decode(&tables); err != nil {
+			return err
+		}
 	}
 
 	bw := bufio.NewWriter(w)
