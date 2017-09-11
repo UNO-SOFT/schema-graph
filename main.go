@@ -11,6 +11,9 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -24,6 +27,9 @@ var replOwner = strings.NewReplacer("'", "''", "\n", " ")
 func main() {
 	flagConnect := flag.String("connect", os.Getenv("BRUNO_ID"), "database to connect to")
 	flagJSON := flag.String("json", "", "json file to read/write from")
+	flagDotEngine := flag.String("dot.K", "osage", "dot engine (-K)")
+	flagDotFormat := flag.String("dot.T", "svg", "dot output format (-T)")
+	flagOut := flag.String("o", "", "output name")
 	flag.Parse()
 
 	var db *sql.DB
@@ -46,15 +52,48 @@ func main() {
 				buf.WriteByte(',')
 			}
 			buf.WriteByte('\'')
-			buf.WriteString(replOwner.Replace(owner))
+			buf.WriteString(strings.ToUpper(replOwner.Replace(owner)))
 			buf.WriteByte('\'')
 		}
 		buf.WriteString(")")
 		ownerW = buf.String()
 	}
 
-	if err := Main(os.Stdout, db, *flagJSON, ownerW); err != nil {
+	w := os.Stdout
+	var fh *os.File
+	if *flagOut != "" && *flagOut != "-" {
+		var err error
+		if fh, err = os.Create(*flagOut); err != nil {
+			log.Fatal(err)
+		}
+		defer fh.Close()
+		w = fh
+	}
+	if err := Main(w, db, *flagJSON, ownerW); err != nil {
 		log.Fatalf("%+v", err)
+	}
+
+	if fh == nil || *flagDotEngine == "" || *flagDotFormat == "" {
+		return
+	}
+	if err := fh.Close(); err != nil {
+		log.Fatal(err)
+	}
+
+	fh, err := os.Create(strings.TrimSuffix(*flagOut, filepath.Ext(*flagOut)) + "." + *flagDotFormat)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer fh.Close()
+	cmd := exec.Command("dot", "-T"+*flagDotFormat, "-K"+*flagDotEngine, *flagOut)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = fh
+	log.Println(cmd.Args)
+	if err := cmd.Run(); err != nil {
+		log.Fatal(errors.Wrapf(err, "%v", cmd.Args))
+	}
+	if err := fh.Close(); err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -115,31 +154,83 @@ func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
 		}
 	}
 
+	for i, t := range tables {
+		uCols := make(map[string]struct{}, len(t.Columns))
+		for _, c := range constraints[t.Owner+"."+t.Name] {
+			if c.Type == "R" {
+				t.Constraints = append(t.Constraints, c.TableConstraint)
+			} else if c.Type == "P" || c.Type == "U" {
+				for _, nm := range c.Columns {
+					uCols[nm] = struct{}{}
+				}
+			}
+		}
+		for i, c := range t.Columns {
+			_, ok := uCols[c.Name]
+			t.Columns[i].Unique = ok
+		}
+		tables[i] = t
+	}
+
+	sort.Sort(sort.Reverse(byRankSize(tables)))
+	sort.Stable(byNameGroup(tables))
+
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 
+	var prevGrp string
 	bw.WriteString("digraph {\n")
 	for _, t := range tables {
-		fmt.Fprintf(bw, "  %s [shape=plain label=<<TABLE TITLE=%q><TR><TD><B>%s.%s</B></TD></TR>\n",
-			name(t.Owner, t.Name), url.QueryEscape(t.Comment), t.Owner, t.Name)
-		for _, col := range t.Columns {
-			fmt.Fprintf(bw, "<TR><TD TITLE=%q>%s %s</TD></TR>\n", url.QueryEscape(col.Comment), col.Name, col.Type)
+		actGrp := grp(t.Name)
+		if prevGrp == "" {
+			fmt.Fprintf(bw, "subgraph cluster_%s {\n", actGrp)
+			prevGrp = actGrp
+		} else if actGrp != prevGrp {
+			fmt.Fprintf(bw, "}\nsubgraph cluster_%s {\n", actGrp)
+			prevGrp = actGrp
 		}
-		bw.WriteString("</TABLE>>];\n")
+		t.PrintNode(bw)
+
 	}
-	for tbl, vv := range constraints {
-		for _, v := range vv {
-			fmt.Fprintf(bw, "  %s -> %s [label=%s];\n", name(tbl), name(v.Owner, v.Table), v.Type)
+	if prevGrp != "" {
+		bw.WriteString("}\n")
+	}
+
+	for _, t := range tables {
+		for _, c := range t.Constraints {
+			fmt.Fprintf(bw, "  %s:%s -> %s:%s [label=%q];\n",
+				name(t.Owner, t.Name), c.Columns[0],
+				name(c.RemoteOwner, c.RemoteTable), c.Columns[0],
+				c.RemoteName)
 		}
 	}
 	bw.WriteString("\n}\n")
 	return bw.Flush()
 }
 
+func (t Table) PrintNode(w io.Writer) {
+	fmt.Fprintf(w, "  %s [shape=plain label=<<TABLE ALIGN=\"LEFT\" TITLE=%q><TR><TD ALIGN=\"CENTER\"><B>%s.%s</B></TD></TR>\n",
+		name(t.Owner, t.Name), url.QueryEscape(t.Comment), t.Owner, t.Name)
+	for _, col := range t.Columns {
+		var attrs string
+		if col.Unique {
+			attrs = " BGCOLOR=\"YELLOW\" "
+		}
+		fmt.Fprintf(w, "<TR><TD PORT=%q TITLE=%q ALIGN=\"LEFT\" %s>%s %s</TD></TR>\n",
+			col.Name,
+			url.QueryEscape(col.Comment), attrs, col.Name, col.Type)
+	}
+	io.WriteString(w, "</TABLE>>];\n")
+
+}
+
 func readTables(db *sql.DB, ownerW string) ([]Table, error) {
 	qryCols := `SELECT A.owner, A.table_name, A.column_name,
   (CASE A.data_type
-     WHEN 'NUMBER' THEN A.data_type||'('||A.data_precision||','||A.data_scale||')'
+     WHEN 'NUMBER' THEN (
+		 CASE WHEN NVL(A.data_precision, 0) = 0 THEN A.data_type
+		   WHEN NVL(A.data_scale, 0) = 0 THEN A.data_type||'('||A.data_precision||')'
+		   ELSE A.data_type||'('||A.data_precision||','||A.data_scale||')' END)
      WHEN 'DATE' THEN A.data_type
      ELSE A.data_type||'('||A.data_length||')'
      END)||(CASE A.nullable WHEN 'N' THEN ' NOT NULL' END) data_type,
@@ -167,6 +258,7 @@ func readTables(db *sql.DB, ownerW string) ([]Table, error) {
 		}
 		ta.Comment = strings.TrimSpace(ta.Comment)
 		c.Comment = strings.TrimSpace(c.Comment)
+		ta.Columns = []Column{c}
 		if tp.Name == "" {
 			tp = ta
 			continue
@@ -187,24 +279,44 @@ func readTables(db *sql.DB, ownerW string) ([]Table, error) {
 type Table struct {
 	Owner, Name, Comment string
 	Columns              []Column
+	Constraints          []TableConstraint
 }
 type Column struct {
 	Name, Type, Comment string
+	Unique              bool
+}
+
+type TableConstraint struct {
+	Columns                              []string
+	RemoteOwner, RemoteTable, RemoteName string
 }
 
 type Constraint struct {
 	Owner, Name, Type, Table string
-	Columns                  []string
+	TableConstraint
 }
 
 func readConstraints(db *sql.DB, ownerW string) (map[string][]Constraint, error) {
-	qryCons := `SELECT A.owner, A.constraint_name, a.constraint_type,
-       B.table_name, B.column_name
+	qryCons := `
+SELECT a.owner, a.constraint_name, 'R' constraint_type,
+       a.table_name, a.column_name,
+       -- referenced pk
+       c.r_owner, c_pk.table_name r_table_name, c_pk.CONSTRAINT_NAME r_pk
+  FROM all_cons_columns a
+  JOIN all_constraints c ON a.owner = c.owner
+                        AND a.constraint_name = c.constraint_name
+  JOIN all_constraints c_pk ON c.r_owner = c_pk.owner
+                           AND c.r_constraint_name = c_pk.constraint_name
+ WHERE c.constraint_type = 'R' ` + ownerW + `
+UNION ALL
+SELECT A.owner, A.constraint_name, a.constraint_type,
+       B.table_name, B.column_name, NULL r_owner, NULL r_table_name, NULL r_pk
   FROM all_cons_columns B, all_constraints A
-  WHERE A.constraint_type IN ('R', 'P', 'U') AND
+  WHERE A.constraint_type IN ('P', 'U') AND
         B.owner = a.owner AND B.constraint_name = A.constraint_name
         ` + ownerW + `
-  ORDER BY A.owner, A.constraint_name`
+  ORDER BY 1, 2, 3, 4, 5
+`
 
 	rows, err := db.Query(qryCons)
 	if err != nil {
@@ -216,14 +328,19 @@ func readConstraints(db *sql.DB, ownerW string) (map[string][]Constraint, error)
 	for rows.Next() {
 		var colName string
 		var ca Constraint
-		if err := rows.Scan(&ca.Owner, &ca.Name, &ca.Type, &ca.Table, &colName); err != nil {
+		if err := rows.Scan(
+			&ca.Owner, &ca.Name, &ca.Type, &ca.Table, &colName,
+			&ca.RemoteOwner, &ca.RemoteTable, &ca.RemoteName,
+		); err != nil {
 			return constraints, err
 		}
+		ca.Columns = []string{colName}
 		if cp.Name == "" {
 			cp = ca
 			continue
 		}
-		if !(ca.Owner == cp.Owner && ca.Name == cp.Name && ca.Type == cp.Type && ca.Table == cp.Table) {
+		if !(ca.Owner == cp.Owner && ca.Name == cp.Name && ca.Type == cp.Type && ca.Table == cp.Table &&
+			ca.RemoteOwner == cp.RemoteOwner && ca.RemoteTable == cp.RemoteTable && ca.RemoteName == cp.RemoteName) {
 			k := cp.Owner + "." + cp.Table
 			constraints[k] = append(constraints[k], cp)
 			cp = ca
@@ -236,4 +353,47 @@ func readConstraints(db *sql.DB, ownerW string) (map[string][]Constraint, error)
 		constraints[k] = append(constraints[k], cp)
 	}
 	return constraints, nil
+}
+
+type byRankSize []Table
+
+func (x byRankSize) Len() int      { return len(x) }
+func (x byRankSize) Swap(i, j int) { x[i], x[j] = x[j], x[i] }
+func (x byRankSize) Less(i, j int) bool {
+	if len(x[i].Constraints) < len(x[j].Constraints) {
+		return true
+	}
+	if len(x[i].Constraints) > len(x[j].Constraints) {
+		return false
+	}
+	return len(x[i].Columns) < len(x[j].Columns)
+}
+
+type byNameGroup []Table
+
+func (x byNameGroup) Len() int      { return len(x) }
+func (x byNameGroup) Swap(i, j int) { x[i], x[j] = x[j], x[i] }
+func (x byNameGroup) Less(i, j int) bool {
+	if x[i].Owner < x[j].Owner {
+		return true
+	}
+	if x[i].Owner > x[j].Owner {
+		return true
+	}
+	if grp(x[i].Name) < grp(x[j].Name) {
+		return true
+	}
+	if grp(x[i].Name) > grp(x[j].Name) {
+		return false
+	}
+	return x[i].Name < x[j].Name
+}
+
+func grp(s string) string {
+	for i, part := range strings.SplitN(s, "_", 3) {
+		if i >= 1 && len(part) > 2 {
+			return part
+		}
+	}
+	return s
 }
