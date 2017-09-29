@@ -238,7 +238,7 @@ func readTables(db *sql.DB, ownerW string) ([]Table, error) {
      C.comments col_comment
   FROM all_col_comments C, all_tab_comments B, all_tab_cols A
   WHERE C.column_name = A.column_name AND C.owner = A.owner AND C.table_name = A.table_name AND
-        B.owner = A.owner AND B.table_name = A.table_name
+        B.owner = A.owner AND B.table_name = A.table_name AND INSTR(A.table_name, '$') = 0
         ` + ownerW + `
   ORDER BY A.owner, A.table_name, A.column_id`
 
