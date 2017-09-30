@@ -7,15 +7,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/mitchellh/go-wordwrap"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 
@@ -209,16 +210,20 @@ func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
 }
 
 func (t Table) PrintNode(w io.Writer) {
-	fmt.Fprintf(w, "  %s [shape=plain label=<<TABLE ALIGN=\"LEFT\" TITLE=%q><TR><TD ALIGN=\"CENTER\"><B>%s.%s</B></TD></TR>\n",
-		name(t.Owner, t.Name), url.QueryEscape(t.Comment), t.Owner, t.Name)
+	fmt.Fprintf(w, "  %s [pencolor=white shape=box label=<<TABLE ALIGN=\"LEFT\"><TR><TD ALIGN=\"CENTER\" COLSPAN=\"3\"><B>%s.%s</B></TD></TR> <TR><TD COLSPAN=\"3\">%s</TD></TR>\n",
+		name(t.Owner, t.Name), t.Owner, t.Name,
+		strings.Replace(html.EscapeString(wordwrap.WrapString(t.Comment, 40)), "\n", "<BR/>\n", -1),
+	)
 	for _, col := range t.Columns {
 		var attrs string
 		if col.Unique {
 			attrs = " BGCOLOR=\"YELLOW\" "
 		}
-		fmt.Fprintf(w, "<TR><TD PORT=%q TITLE=%q ALIGN=\"LEFT\" %s>%s %s</TD></TR>\n",
+		fmt.Fprintf(w, "<TR><TD PORT=%q ALIGN=\"LEFT\"%s>%s</TD><TD ALIGN=\"LEFT\">%s</TD><TD ALIGN=\"RIGHT\">%s</TD></TR>\n",
 			col.Name,
-			url.QueryEscape(col.Comment), attrs, col.Name, col.Type)
+			attrs, col.Name, html.EscapeString(col.Type),
+			strings.Replace(html.EscapeString(wordwrap.WrapString(col.Comment, 25)), "\n", "<BR/>\n", -1),
+		)
 	}
 	io.WriteString(w, "</TABLE>>];\n")
 
