@@ -1,3 +1,18 @@
+// Copyright 2017 Tamás Gulácsi
+//
+//
+//    Licensed under the Apache License, Version 2.0 (the "License");
+//    you may not use this file except in compliance with the License.
+//    You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//    Unless required by applicable law or agreed to in writing, software
+//    distributed under the License is distributed on an "AS IS" BASIS,
+//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//    See the License for the specific language governing permissions and
+//    limitations under the License.
+
 package main
 
 import (
@@ -60,24 +75,46 @@ func main() {
 		ownerW = buf.String()
 	}
 
-	w := os.Stdout
-	var fh *os.File
-	if *flagOut != "" && *flagOut != "-" {
-		var err error
-		if fh, err = os.Create(*flagOut); err != nil {
-			log.Fatal(err)
-		}
-		defer fh.Close()
-		w = fh
-	}
-	if err := Main(w, db, *flagJSON, ownerW); err != nil {
+	tables, err := getTables(db, *flagJSON, ownerW)
+	if err != nil {
 		log.Fatalf("%+v", err)
 	}
 
-	if fh == nil || *flagDotEngine == "" || *flagDotFormat == "" {
+	if *flagOut == "" || *flagOut == "-" {
+		defer os.Stdout.Close()
+		if err = PrintDOT(os.Stdout, tables); err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
-	if err := fh.Close(); err != nil {
+
+	fn := *flagOut
+	if ext := filepath.Ext(fn); ext != "" {
+		fn = fn[:len(fn)-len(ext)]
+	}
+
+	var grp errgroup.Group
+	for ext, f := range map[string]func(io.Writer, []Table) error{
+		"dot":     PrintDOT,
+		"gml":     PrintGML,
+		"graphml": PrintGraphML,
+	} {
+		ext, f := ext, f
+		grp.Go(func() error {
+			fh, err := os.Create(fn + "." + ext)
+			if err != nil {
+				return err
+			}
+			log.Printf("%q: %q", ext, fh.Name())
+			err = f(fh, tables)
+			if closeErr := fh.Close(); closeErr != nil && err == nil {
+				err = closeErr
+			}
+			return err
+		})
+	}
+
+	if err := grp.Wait(); err != nil {
 		log.Fatal(err)
 	}
 
@@ -104,7 +141,7 @@ var replDot = strings.NewReplacer(".", Dot, "$", "_")
 
 func name(s ...string) string { return replDot.Replace(strings.Join(s, Dot)) }
 
-func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
+func getTables(db *sql.DB, jsonFile string, ownerW string) ([]Table, error) {
 	var constraints map[string][]Constraint
 	var tables []Table
 	if db != nil {
@@ -121,37 +158,37 @@ func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
 			return err
 		})
 		if err := grp.Wait(); err != nil {
-			return err
+			return tables, err
 		}
 		if jsonFile != "" {
 			fh, err := os.Create(jsonFile)
 			if err != nil {
-				return err
+				return tables, err
 			}
 			defer fh.Close()
 			enc := json.NewEncoder(fh)
 			if err := enc.Encode(constraints); err != nil {
-				return err
+				return tables, err
 			}
 			if err := enc.Encode(tables); err != nil {
-				return err
+				return tables, err
 			}
 			if err := fh.Close(); err != nil {
-				return err
+				return tables, err
 			}
 		}
 	} else {
 		fh, err := os.Open(jsonFile)
 		if err != nil {
-			return err
+			return tables, err
 		}
 		defer fh.Close()
 		dec := json.NewDecoder(fh)
 		if err := dec.Decode(&constraints); err != nil {
-			return err
+			return tables, err
 		}
 		if err := dec.Decode(&tables); err != nil {
-			return err
+			return tables, err
 		}
 	}
 
@@ -176,6 +213,9 @@ func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
 	sort.Sort(sort.Reverse(byRankSize(tables)))
 	sort.Stable(byNameGroup(tables))
 
+	return tables, nil
+}
+func PrintDOT(w io.Writer, tables []Table) error {
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 
@@ -190,7 +230,7 @@ func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
 			fmt.Fprintf(bw, "}\nsubgraph cluster_%s {\n", actGrp)
 			prevGrp = actGrp
 		}
-		t.PrintNode(bw)
+		t.PrintNodeDOT(bw)
 
 	}
 	if prevGrp != "" {
@@ -199,9 +239,16 @@ func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
 
 	for _, t := range tables {
 		for _, c := range t.Constraints {
+			var col string
+			if len(c.Columns) != 0 {
+				col = c.Columns[0]
+			}
+			if c.RemoteTable == "" {
+				continue
+			}
 			fmt.Fprintf(bw, "  %s:%s -> %s:%s [label=%q];\n",
-				name(t.Owner, t.Name), c.Columns[0],
-				name(c.RemoteOwner, c.RemoteTable), c.Columns[0],
+				name(t.Owner, t.Name), col,
+				name(c.RemoteOwner, c.RemoteTable), col,
 				c.RemoteName)
 		}
 	}
@@ -209,7 +256,7 @@ func Main(w io.Writer, db *sql.DB, jsonFile string, ownerW string) error {
 	return bw.Flush()
 }
 
-func (t Table) PrintNode(w io.Writer) {
+func (t Table) PrintNodeDOT(w io.Writer) {
 	fmt.Fprintf(w, "  %s [pencolor=white shape=box label=<<TABLE ALIGN=\"LEFT\"><TR><TD ALIGN=\"CENTER\" COLSPAN=\"3\"><B>%s.%s</B></TD></TR> <TR><TD COLSPAN=\"3\">%s</TD></TR>\n",
 		name(t.Owner, t.Name), t.Owner, t.Name,
 		strings.Replace(html.EscapeString(wordwrap.WrapString(t.Comment, 40)), "\n", "<BR/>\n", -1),
@@ -226,7 +273,101 @@ func (t Table) PrintNode(w io.Writer) {
 		)
 	}
 	io.WriteString(w, "</TABLE>>];\n")
+}
 
+func PrintGML(w io.Writer, tables []Table) error {
+	bw := bufio.NewWriter(w)
+	defer bw.Flush()
+
+	bw.WriteString("graph [\n")
+	for _, t := range tables {
+		t.PrintNodeGML(bw)
+	}
+
+	for _, t := range tables {
+		for _, c := range t.Constraints {
+			var col string
+			if len(c.Columns) != 0 {
+				col = c.Columns[0]
+			}
+			if c.RemoteTable == "" {
+				continue
+			}
+			fmt.Fprintf(bw, "\tedge [\n\t\tsource %s:%s\n\t\ttarget %s:%s\n\t\tlabel %q\n\t]\n",
+				name(t.Owner, t.Name), col,
+				name(c.RemoteOwner, c.RemoteTable), col,
+				c.RemoteName)
+		}
+	}
+	bw.WriteString("]\n")
+	return bw.Flush()
+}
+
+func (t Table) PrintNodeGML(w io.Writer) {
+	fmt.Fprintf(w, "\tnode [\n\t\tid %s\n\t\t%s\n\t]\n",
+		name(t.Owner, t.Name),
+		html.EscapeString(wordwrap.WrapString(t.Comment, 40)),
+	)
+}
+
+func PrintGraphML(w io.Writer, tables []Table) error {
+	bw := bufio.NewWriter(w)
+	defer bw.Flush()
+
+	var prevGrp string
+	bw.WriteString("digraph {\n")
+	for _, t := range tables {
+		actGrp := grp(t.Name)
+		if prevGrp == "" {
+			fmt.Fprintf(bw, "subgraph cluster_%s {\n", actGrp)
+			prevGrp = actGrp
+		} else if actGrp != prevGrp {
+			fmt.Fprintf(bw, "}\nsubgraph cluster_%s {\n", actGrp)
+			prevGrp = actGrp
+		}
+		t.PrintNodeDOT(bw)
+
+	}
+	if prevGrp != "" {
+		bw.WriteString("}\n")
+	}
+
+	for _, t := range tables {
+		for _, c := range t.Constraints {
+			var col string
+			if len(c.Columns) != 0 {
+				col = c.Columns[0]
+			}
+			if c.RemoteTable == "" {
+				continue
+			}
+			fmt.Fprintf(bw, "  %s:%s -> %s:%s [label=%q];\n",
+				name(t.Owner, t.Name), col,
+				name(c.RemoteOwner, c.RemoteTable), col,
+				c.RemoteName)
+		}
+	}
+	bw.WriteString("\n}\n")
+	return bw.Flush()
+}
+
+func (t Table) PrintNodeGraphML(w io.Writer) {
+	fmt.Fprintf(w, "  %s [pencolor=white shape=box label=<<TABLE ALIGN=\"LEFT\"><TR><TD ALIGN=\"CENTER\" COLSPAN=\"3\"><B>%s.%s</B></TD></TR> <TR><TD COLSPAN=\"3\">%s</TD></TR>\n",
+		name(t.Owner, t.Name), t.Owner, t.Name,
+		strings.Replace(html.EscapeString(wordwrap.WrapString(t.Comment, 40)), "\n", "<BR/>\n", -1),
+	)
+	for _, col := range t.Columns {
+		var attrs string
+		if col.Unique {
+			attrs = " BGCOLOR=\"YELLOW\" "
+		}
+		fmt.Fprintf(w, "<TR><TD PORT=%q ALIGN=\"LEFT\"%s>%s</TD><TD ALIGN=\"LEFT\">%s</TD><TD ALIGN=\"RIGHT\">%s</TD></TR>\n",
+			col.Name,
+			attrs, col.Name, html.EscapeString(col.Type),
+			strings.Replace(html.EscapeString(wordwrap.WrapString(col.Comment, 25)), "\n", "<BR/>\n", -1),
+		)
+	}
+	io.WriteString(w, "</TABLE>>];\n")
 }
 
 func readTables(db *sql.DB, ownerW string) ([]Table, error) {
