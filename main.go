@@ -1,4 +1,4 @@
-// Copyright 2017 Tamás Gulácsi
+// Copyright 2017, 2020 Tamás Gulácsi
 //
 //
 //    Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -32,15 +33,19 @@ import (
 	"strings"
 
 	"github.com/mitchellh/go-wordwrap"
-	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 
-	_ "gopkg.in/goracle.v2"
+	"github.com/godror/godror"
 )
 
 var replOwner = strings.NewReplacer("'", "''", "\n", " ")
 
 func main() {
+	if err := Main(); err != nil {
+		log.Fatalf("ERROR: %+v", err)
+	}
+}
+func Main() error {
 	flagConnect := flag.String("connect", os.Getenv("BRUNO_ID"), "database to connect to")
 	flagJSON := flag.String("json", "", "json file to read/write from")
 	flagDotEngine := flag.String("dot.K", "osage", "dot engine (-K)")
@@ -51,9 +56,9 @@ func main() {
 	var db *sql.DB
 	if *flagConnect != "" || *flagJSON == "" {
 		var err error
-		db, err = sql.Open("goracle", *flagConnect)
+		db, err = sql.Open("godror", *flagConnect)
 		if err != nil {
-			log.Fatal(errors.Wrap(err, *flagConnect))
+			return fmt.Errorf("%q: %w", *flagConnect, err)
 		}
 		defer db.Close()
 	}
@@ -75,17 +80,16 @@ func main() {
 		ownerW = buf.String()
 	}
 
-	tables, err := getTables(db, *flagJSON, ownerW)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tables, err := getTables(ctx, db, *flagJSON, ownerW)
 	if err != nil {
-		log.Fatalf("%+v", err)
+		return err
 	}
 
 	if *flagOut == "" || *flagOut == "-" {
 		defer os.Stdout.Close()
-		if err = PrintDOT(os.Stdout, tables); err != nil {
-			log.Fatal(err)
-		}
-		return
+		return PrintDOT(os.Stdout, tables)
 	}
 
 	fn := *flagOut
@@ -95,9 +99,9 @@ func main() {
 
 	var grp errgroup.Group
 	for ext, f := range map[string]func(io.Writer, []Table) error{
-		"dot":     PrintDOT,
-		"gml":     PrintGML,
-		"graphml": PrintGraphML,
+		"dot": PrintDOT,
+		//"gml":     PrintGML,
+		//"graphml": PrintGraphML,
 	} {
 		ext, f := ext, f
 		grp.Go(func() error {
@@ -115,12 +119,12 @@ func main() {
 	}
 
 	if err := grp.Wait(); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	fh, err := os.Create(strings.TrimSuffix(*flagOut, filepath.Ext(*flagOut)) + "." + *flagDotFormat)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer fh.Close()
 	cmd := exec.Command("dot", "-T"+*flagDotFormat, "-K"+*flagDotEngine, *flagOut)
@@ -128,11 +132,9 @@ func main() {
 	cmd.Stdout = fh
 	log.Println(cmd.Args)
 	if err := cmd.Run(); err != nil {
-		log.Fatal(errors.Wrapf(err, "%v", cmd.Args))
+		return fmt.Errorf("%v: %w", cmd.Args, err)
 	}
-	if err := fh.Close(); err != nil {
-		log.Fatal(err)
-	}
+	return fh.Close()
 }
 
 const Dot = "__"
@@ -141,20 +143,20 @@ var replDot = strings.NewReplacer(".", Dot, "$", "_")
 
 func name(s ...string) string { return replDot.Replace(strings.Join(s, Dot)) }
 
-func getTables(db *sql.DB, jsonFile string, ownerW string) ([]Table, error) {
+func getTables(ctx context.Context, db *sql.DB, jsonFile string, ownerW string) ([]Table, error) {
 	var constraints map[string][]Constraint
 	var tables []Table
 	if db != nil {
 		var grp errgroup.Group
 		grp.Go(func() error {
 			var err error
-			constraints, err = readConstraints(db, ownerW)
+			constraints, err = readConstraints(ctx, db, ownerW)
 			return err
 		})
 
 		grp.Go(func() error {
 			var err error
-			tables, err = readTables(db, ownerW)
+			tables, err = readTables(ctx, db, ownerW)
 			return err
 		})
 		if err := grp.Wait(); err != nil {
@@ -314,63 +316,51 @@ func PrintGraphML(w io.Writer, tables []Table) error {
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 
+	bw.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://graphml.graphdrawing.org/xmlns
+     http://graphml.graphdrawing.org/xmlns/1.0/graphml.xsd">
+ <graph id="G" edgedefault="directed">
+ `)
 	var prevGrp string
-	bw.WriteString("digraph {\n")
 	for _, t := range tables {
 		actGrp := grp(t.Name)
-		if prevGrp == "" {
-			fmt.Fprintf(bw, "subgraph cluster_%s {\n", actGrp)
-			prevGrp = actGrp
-		} else if actGrp != prevGrp {
-			fmt.Fprintf(bw, "}\nsubgraph cluster_%s {\n", actGrp)
-			prevGrp = actGrp
+		if actGrp != prevGrp {
+			if prevGrp != "" {
+				fmt.Fprintf(bw, "\n</graph></node>\n")
+			}
+			fmt.Fprintf(bw, `<node id="cluster_%s"><graph id="cluster_%s" edgedefault="directed">
+`,
+				actGrp, actGrp)
 		}
-		t.PrintNodeDOT(bw)
-
+		prevGrp = actGrp
+		t.PrintNodeGraphML(bw)
 	}
 	if prevGrp != "" {
-		bw.WriteString("}\n")
+		fmt.Fprintf(bw, "\n</graph></node>\n")
 	}
 
 	for _, t := range tables {
 		for _, c := range t.Constraints {
-			var col string
-			if len(c.Columns) != 0 {
-				col = c.Columns[0]
-			}
 			if c.RemoteTable == "" {
 				continue
 			}
-			fmt.Fprintf(bw, "  %s:%s -> %s:%s [label=%q];\n",
-				name(t.Owner, t.Name), col,
-				name(c.RemoteOwner, c.RemoteTable), col,
-				c.RemoteName)
+			fmt.Fprintf(bw, "  <edge source=\"%s\"  target=\"%s\" />\n",
+				name(t.Owner, t.Name),
+				name(c.RemoteOwner, c.RemoteTable),
+			)
 		}
 	}
-	bw.WriteString("\n}\n")
+	bw.WriteString("\n</graph></graphml>\n")
 	return bw.Flush()
 }
 
 func (t Table) PrintNodeGraphML(w io.Writer) {
-	fmt.Fprintf(w, "  %s [pencolor=white shape=box label=<<TABLE ALIGN=\"LEFT\"><TR><TD ALIGN=\"CENTER\" COLSPAN=\"3\"><B>%s.%s</B></TD></TR> <TR><TD COLSPAN=\"3\">%s</TD></TR>\n",
-		name(t.Owner, t.Name), t.Owner, t.Name,
-		strings.Replace(html.EscapeString(wordwrap.WrapString(t.Comment, 40)), "\n", "<BR/>\n", -1),
-	)
-	for _, col := range t.Columns {
-		var attrs string
-		if col.Unique {
-			attrs = " BGCOLOR=\"YELLOW\" "
-		}
-		fmt.Fprintf(w, "<TR><TD PORT=%q ALIGN=\"LEFT\"%s>%s</TD><TD ALIGN=\"LEFT\">%s</TD><TD ALIGN=\"RIGHT\">%s</TD></TR>\n",
-			col.Name,
-			attrs, col.Name, html.EscapeString(col.Type),
-			strings.Replace(html.EscapeString(wordwrap.WrapString(col.Comment, 25)), "\n", "<BR/>\n", -1),
-		)
-	}
-	io.WriteString(w, "</TABLE>>];\n")
+	fmt.Fprintf(w, "  <node id=\"%s\" />\n", name(t.Owner, t.Name))
 }
 
-func readTables(db *sql.DB, ownerW string) ([]Table, error) {
+func readTables(ctx context.Context, db *sql.DB, ownerW string) ([]Table, error) {
 	qryCols := `SELECT A.owner, A.table_name, A.column_name,
   (CASE A.data_type
      WHEN 'NUMBER' THEN (
@@ -388,9 +378,9 @@ func readTables(db *sql.DB, ownerW string) ([]Table, error) {
         ` + ownerW + `
   ORDER BY A.owner, A.table_name, A.column_id`
 
-	rows, err := db.Query(qryCols)
+	rows, err := db.QueryContext(ctx, qryCols, godror.FetchArraySize(1024), godror.PrefetchCount(1024+1))
 	if err != nil {
-		return nil, errors.Wrap(err, qryCols)
+		return nil, fmt.Errorf("%s: %w", qryCols, err)
 	}
 	defer rows.Close()
 
@@ -442,7 +432,7 @@ type Constraint struct {
 	TableConstraint
 }
 
-func readConstraints(db *sql.DB, ownerW string) (map[string][]Constraint, error) {
+func readConstraints(ctx context.Context, db *sql.DB, ownerW string) (map[string][]Constraint, error) {
 	qryCons := `
 SELECT a.owner, a.constraint_name, 'R' constraint_type,
        a.table_name, a.column_name,
@@ -464,9 +454,9 @@ SELECT A.owner, A.constraint_name, a.constraint_type,
   ORDER BY 1, 2, 3, 4, 5
 `
 
-	rows, err := db.Query(qryCons)
+	rows, err := db.QueryContext(ctx, qryCons, godror.FetchArraySize(1024), godror.PrefetchCount(1024+1))
 	if err != nil {
-		return nil, errors.Wrap(err, qryCons)
+		return nil, fmt.Errorf("%s: %w", qryCons, err)
 	}
 	defer rows.Close()
 	constraints := make(map[string][]Constraint)
@@ -524,12 +514,11 @@ func (x byNameGroup) Less(i, j int) bool {
 		return true
 	}
 	if x[i].Owner > x[j].Owner {
-		return true
+		return false
 	}
-	if grp(x[i].Name) < grp(x[j].Name) {
+	if gi, gj := grp(x[i].Name), grp(x[j].Name); gi < gj {
 		return true
-	}
-	if grp(x[i].Name) > grp(x[j].Name) {
+	} else if gi > gj {
 		return false
 	}
 	return x[i].Name < x[j].Name
